@@ -20,6 +20,7 @@ import (
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/smart"
 	"github.com/metacubex/mihomo/component/smart/lightgbm"
+	"github.com/metacubex/mihomo/component/smart/race"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/log"
@@ -50,6 +51,8 @@ const (
 
 	maxCountValue       = 1000000
 	maxTrafficStatValue = 10000000.0
+
+	defaultTopN = 5
 )
 
 var (
@@ -167,6 +170,16 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 		return nil, errors.New("no proxy available")
 	}
 
+	updateTried := func(tried map[string]bool, proxy C.Proxy) {
+		if p, ok := proxy.(*race.Proxy); ok {
+			for _, n := range p.Names() {
+				tried[n] = true
+			}
+		} else {
+			tried[proxy.Name()] = true
+		}
+	}
+
 	tryDial := func(proxy C.Proxy, proxies []C.Proxy, triedProxies map[string]bool, maxRetries int, wrapMetric bool) (C.Conn, error) {
 		var finalErr error
 		for i := 0; i < maxRetries; i++ {
@@ -182,34 +195,24 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 				timeout = C.DefaultTCPTimeout
 			}
 			ctxDial, cancel := context.WithTimeout(ctx, timeout)
+			var ok bool
+			if s.store != nil && wrapMetric {
+				proxy, ok = s.wrapProxyWithMetric(proxy, metadata)
+			}
 			start := time.Now()
 			c, err := proxy.DialContext(ctxDial, metadata)
 			cancel()
 			connectTime := time.Since(start).Milliseconds()
 
 			if err == nil {
-				if s.store != nil && wrapMetric {
-					wrappedConn, wrapErr := s.wrapConnWithMetric(c, proxy, metadata, connectTime)
-					if wrapErr != nil {
-						c.Close()
-						finalErr = wrapErr
-						if i == maxRetries-1 {
-							break
-						}
-						if s.selected != "" {
-							break
-						}
-						proxy = s.selectNextProxy(metadata, proxies, triedProxies)
-						if proxy == nil {
-							break
-						}
-						triedProxies[proxy.Name()] = true
-						continue
-					}
-					return wrappedConn, nil
-				}
 				c.AppendToChains(s)
-				s.onDialSuccess()
+				if s.store != nil && wrapMetric {
+					if ok {
+						c = s.registerClosureMetricsCallback(c, proxy, metadata)
+					} else {
+						c = s.wrapConnWithMetric(c, proxy, metadata, connectTime)
+					}
+				}
 				return c, nil
 			}
 
@@ -225,7 +228,7 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 			if proxy == nil {
 				break
 			}
-			triedProxies[proxy.Name()] = true
+			updateTried(triedProxies, proxy)
 		}
 		if finalErr != nil && s.store != nil {
 			domain, _ := smart.GetEffectiveDomain(metadata.Host, metadata.DstIP.String())
@@ -243,7 +246,7 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 		if proxy == nil {
 			return nil, errors.New("no proxy found in network failure mode")
 		}
-		triedProxies[proxy.Name()] = true
+		updateTried(triedProxies, proxy)
 		return tryDial(proxy, proxies, triedProxies, maxRetries, true)
 	}
 
@@ -251,8 +254,7 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 	if proxy == nil {
 		proxy = proxies[0]
 	}
-	triedProxies = make(map[string]bool)
-	triedProxies[proxy.Name()] = true
+	updateTried(triedProxies, proxy)
 	return tryDial(proxy, proxies, triedProxies, maxRetries, true)
 }
 
@@ -327,7 +329,13 @@ func (s *Smart) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 		if metadata != nil {
 			domain, _ = smart.GetEffectiveDomain(metadata.Host, metadata.DstIP.String())
 			if domain != "" {
-				s.store.StoreUnwrapResult(s.Name(), s.configName, domain, proxy.Name())
+				var names []string
+				if p, ok := proxy.(*race.Proxy); ok {
+					names = p.Names()
+				} else {
+					names = []string{proxy.Name()}
+				}
+				s.store.StoreUnwrapResult(s.Name(), s.configName, domain, names)
 			}
 		}
 	}
@@ -339,13 +347,33 @@ func (s *Smart) IsL3Protocol(metadata *C.Metadata) bool {
 	return s.Unwrap(metadata, false).IsL3Protocol(metadata)
 }
 
-func (s *Smart) wrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64) (C.Conn, error) {
-	c.AppendToChains(s)
+func (s *Smart) wrapProxyWithMetric(proxy C.Proxy, metadata *C.Metadata) (C.Proxy, bool) {
+	if p, ok := proxy.(*race.Proxy); ok {
+		start := time.Now()
+		p.SetCallback(func(on int, lat *race.Latency, proxy C.Proxy, conn C.Conn, err error) {
+			if on == race.OnDial && err != nil {
+				s.recordConnectionStats("failed", metadata, proxy, 0, 0, 0, 0, 0, 0, 0, false, err)
+			} else if on == race.OnRead {
+				if err == nil {
+					s.onDialSuccess()
+					s.recordConnectionStats("success", metadata, proxy, lat.Dial.Milliseconds(), time.Since(start).Milliseconds(), 0, 0, 0, 0, 0, false, nil)
+				} else {
+					s.onDialFailed(proxy.Type(), err, s.GroupBase.healthCheck)
+					s.recordConnectionStats("failed", metadata, proxy, 0, 0, 0, 0, 0, 0, 0, false, err)
+				}
+			}
+		})
+		return p, true
+	}
+	return proxy, false
+}
+
+func (s *Smart) wrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metadata, connectTime int64) C.Conn {
 	c = s.registerClosureMetricsCallback(c, proxy, metadata)
 
 	start := time.Now()
 
-	wrappedConn := callback.NewFirstWriteCallBackConn(c, func(err error) {
+	wrappedConn := callback.NewFirstReadCallBackConn(c, func(err error) {
 		latency := time.Since(start).Milliseconds()
 		if err == nil {
 			s.onDialSuccess()
@@ -356,7 +384,7 @@ func (s *Smart) wrapConnWithMetric(c C.Conn, proxy C.Proxy, metadata *C.Metadata
 		}
 	})
 
-	return wrappedConn, nil
+	return wrappedConn
 }
 
 func (s *Smart) Set(name string) error {
@@ -521,7 +549,7 @@ func (s *Smart) runPrefetch() {
 			proxyMap[p.Name()] = p.Name()
 		}
 	}
-	s.store.RunPrefetch(s.Name(), s.configName, proxyMap)
+	s.store.RunPrefetch(s.Name(), s.configName, proxyMap, defaultTopN)
 }
 
 func (s *Smart) updateNodeRanking() {
@@ -693,18 +721,21 @@ func (s *Smart) selectProxy(metadata *C.Metadata, touch bool) C.Proxy {
 		}
 	}
 
-	findProxyByName := func(name string) C.Proxy {
-		if blockedNodes[name] {
-			return nil
-		}
-
-		for _, p := range proxies {
-			if p.Name() == name {
-				if p.AliveForTestUrl(s.testUrl) {
-					return p
+	proxyByName := make(map[string]C.Proxy)
+	for _, p := range proxies {
+		proxyByName[p.Name()] = p
+	}
+	findProxyByNames := func(names []string) C.Proxy {
+		proxies := make([]C.Proxy, 0, len(names))
+		for _, name := range names {
+			if !blockedNodes[name] {
+				if p, ok := proxyByName[name]; ok && p.AliveForTestUrl(s.testUrl) {
+					proxies = append(proxies, p)
 				}
-				break
 			}
+		}
+		if len(proxies) > 0 {
+			return race.NewProxy(proxies...)
 		}
 		return nil
 	}
@@ -716,24 +747,24 @@ func (s *Smart) selectProxy(metadata *C.Metadata, touch bool) C.Proxy {
 
 	trySelector := func(target string, weightType string) C.Proxy {
 		// 检查解析缓存
-		if cachedProxyName := s.store.GetUnwrapResult(s.Name(), s.configName, target); cachedProxyName != "" {
-			if proxy := findProxyByName(cachedProxyName); proxy != nil {
+		if cachedProxyNames := s.store.GetUnwrapResult(s.Name(), s.configName, target); len(cachedProxyNames) != 0 {
+			if proxy := findProxyByNames(cachedProxyNames); proxy != nil {
 				s.store.DeleteCacheResult(smart.KeyTypeUnwrap, s.Name(), s.configName, target)
 				return proxy
 			}
 		}
 
 		// 检查预解析缓存
-		if cachedProxyName, _ := s.store.GetPrefetchResult(s.Name(), s.configName, target, weightType); cachedProxyName != "" {
-			if proxy := findProxyByName(cachedProxyName); proxy != nil {
+		if cachedProxyNames, _ := s.store.GetPrefetchResult(s.Name(), s.configName, target, weightType); len(cachedProxyNames) != 0 {
+			if proxy := findProxyByNames(cachedProxyNames); proxy != nil {
 				return proxy
 			}
 		}
 
 		// 实时计算最佳节点
-		bestNodes, _, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, target, weightType, false)
-		if err == nil && len(bestNodes) > 0 && bestNodes[0] != "" {
-			if proxy := findProxyByName(bestNodes[0]); proxy != nil {
+		bestNodes, _, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, target, weightType, false, defaultTopN)
+		if err == nil && len(bestNodes) != 0 {
+			if proxy := findProxyByNames(bestNodes); proxy != nil {
 				return proxy
 			}
 		}
@@ -770,16 +801,22 @@ func (s *Smart) selectProxy(metadata *C.Metadata, touch bool) C.Proxy {
 }
 
 func (s *Smart) selectNextProxy(metadata *C.Metadata, availableProxies []C.Proxy, triedProxies map[string]bool) C.Proxy {
-	findFirstAvailable := func(names []string) C.Proxy {
-		for _, name := range names {
-			if name == "" || triedProxies[name] {
-				continue
-			}
-			for _, p := range availableProxies {
-				if p.Name() == name && p.AliveForTestUrl(s.testUrl) {
-					return p
+	availableProxyByName := make(map[string]C.Proxy)
+	for _, p := range availableProxies {
+		availableProxyByName[p.Name()] = p
+	}
+
+	findAvailable := func(names []string) C.Proxy {
+		proxies := make([]C.Proxy, 0, len(names))
+		for _, node := range names {
+			if node != "" && !triedProxies[node] {
+				if p, ok := availableProxyByName[node]; ok && p.AliveForTestUrl(s.testUrl) {
+					proxies = append(proxies, p)
 				}
 			}
+		}
+		if len(proxies) > 0 {
+			return race.NewProxy(proxies...)
 		}
 		return nil
 	}
@@ -800,9 +837,9 @@ func (s *Smart) selectNextProxy(metadata *C.Metadata, availableProxies []C.Proxy
 
 	domain, _ := smart.GetEffectiveDomain(metadata.Host, metadata.DstIP.String())
 	if domain != "" {
-		bestNodes, _, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, domain, weightType, false)
+		bestNodes, _, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, domain, weightType, false, len(triedProxies)+defaultTopN)
 		if err == nil {
-			if proxy := findFirstAvailable(bestNodes); proxy != nil {
+			if proxy := findAvailable(bestNodes); proxy != nil {
 				return proxy
 			}
 		}
@@ -816,9 +853,9 @@ func (s *Smart) selectNextProxy(metadata *C.Metadata, availableProxies []C.Proxy
 		} else {
 			asnWeightType = smart.WeightTypeUDPASN + ":" + asnNumber
 		}
-		bestNodes, _, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, asnNumber, asnWeightType, false)
+		bestNodes, _, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, asnNumber, asnWeightType, false, len(triedProxies)+defaultTopN)
 		if err == nil {
-			if proxy := findFirstAvailable(bestNodes); proxy != nil {
+			if proxy := findAvailable(bestNodes); proxy != nil {
 				return proxy
 			}
 		}
@@ -1633,6 +1670,10 @@ func (s *Smart) registerClosureMetricsCallback(c C.Conn, proxy C.Proxy, metadata
 				maxUploadRate := info.MaxUploadRate.Load()
 				maxDownloadRate := info.MaxDownloadRate.Load()
 
+				if r, ok := c.(race.Race); ok {
+					proxy = r.Winner()
+				}
+
 				s.recordConnectionStats("closed", metadata, proxy, 0, 0,
 					uploadTotal, downloadTotal, maxUploadRate, maxDownloadRate, connectionDuration, false, nil)
 				return
@@ -1732,10 +1773,11 @@ func (s *Smart) cleanupDegradedNodePreferenceCache(metadata *C.Metadata, domain,
 	s.store.DeleteCacheResult(smart.KeyTypePrefetch, s.Name(), s.configName, domain)
 
 	// 处理域名相关缓存
-	bestNodes, bestWeights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, domain, weightType, false)
+	bestNodes, bestWeights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, domain, weightType, false, defaultTopN)
 	var bestNode string
 	var bestWeight float64
-	for i := 0; i < len(bestNodes); i++ {
+	var i int
+	for i = 0; i < len(bestNodes); i++ {
 		if bestNodes[i] != "" && bestNodes[i] != nodeName {
 			bestNode = bestNodes[i]
 			bestWeight = bestWeights[i]
@@ -1743,9 +1785,10 @@ func (s *Smart) cleanupDegradedNodePreferenceCache(metadata *C.Metadata, domain,
 		}
 	}
 	if err == nil && bestNode != "" && bestWeight > currentWeight {
-		s.store.StorePrefetchResult(s.Name(), s.configName, domain, weightType, bestNode, bestWeight)
-		log.Debugln("[Smart] Added new prefetch result for domain: [%s] -> [%s] (weight: %.4f, type: %s)",
-			addressDisplay, bestNode, bestWeight, weightType)
+		s.store.StorePrefetchResult(s.Name(), s.configName, domain, weightType, bestNodes[i:], bestWeights[i:])
+		log.Debugln("[Smart] Added new prefetch result for domain: [%s] -> [%v] (weight: %v, type: %s)",
+			domain, bestNodes[i:], bestWeights[i:], weightType)
+
 	}
 
 	// 处理ASN相关缓存
@@ -1758,10 +1801,11 @@ func (s *Smart) cleanupDegradedNodePreferenceCache(metadata *C.Metadata, domain,
 
 		s.store.DeleteCacheResult(smart.KeyTypePrefetch, s.Name(), s.configName, asnInfo)
 
-		bestNodes, bestWeights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, asnInfo, fullAsnWeightType, false)
+		bestNodes, bestWeights, err := s.store.GetBestProxyForTarget(s.Name(), s.configName, asnInfo, fullAsnWeightType, false, defaultTopN)
 		var asnBestNode string
 		var asnBestWeight float64
-		for i := 0; i < len(bestNodes); i++ {
+		var i int
+		for i = 0; i < len(bestNodes); i++ {
 			if bestNodes[i] != "" && bestNodes[i] != nodeName {
 				asnBestNode = bestNodes[i]
 				asnBestWeight = bestWeights[i]
@@ -1769,9 +1813,9 @@ func (s *Smart) cleanupDegradedNodePreferenceCache(metadata *C.Metadata, domain,
 			}
 		}
 		if err == nil && asnBestNode != "" && asnBestWeight > currentWeight {
-			s.store.StorePrefetchResult(s.Name(), s.configName, asnInfo, fullAsnWeightType, asnBestNode, asnBestWeight)
-			log.Debugln("[Smart] Added new ASN prefetch result: [%s] -> [%s] (weight: %.4f, type: %s)",
-				asnInfo, asnBestNode, asnBestWeight, fullAsnWeightType)
+			s.store.StorePrefetchResult(s.Name(), s.configName, asnInfo, fullAsnWeightType, bestNodes[i:], bestWeights[i:])
+			log.Debugln("[Smart] Added new ASN prefetch result: [%s] -> [%v] (weight: %v, type: %s)",
+				asnInfo, bestNodes[i:], bestWeights[i:], fullAsnWeightType)
 		}
 	}
 

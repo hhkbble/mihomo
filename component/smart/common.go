@@ -4,12 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"regexp"
 
 	"github.com/metacubex/mihomo/common/cmd"
 	"github.com/metacubex/mihomo/common/lru"
@@ -136,6 +136,15 @@ type (
 		Ranking     map[string]string `json:"ranking"`
 		LastUpdated time.Time         `json:"last_updated"`
 	}
+
+	NodeWithWeight struct {
+		Node    string    `json:"node"`
+		Weight  float64   `json:"weight"`
+		Nodes   []string  `json:"nodes"`
+		Weights []float64 `json:"weights"`
+	}
+
+	PrefetchMap map[string]NodeWithWeight
 )
 
 func InitializeGlobalParams() {

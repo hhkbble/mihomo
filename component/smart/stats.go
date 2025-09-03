@@ -31,10 +31,10 @@ type AtomicStatsRecord struct {
 
 	weights         atomic.TypedValue[map[string]float64]
 	uploadTotal     *atomic.Float64
-    downloadTotal   *atomic.Float64
-    duration        *atomic.Float64
-    maxUploadRate   *atomic.Float64
-    maxDownloadRate *atomic.Float64
+	downloadTotal   *atomic.Float64
+	duration        *atomic.Float64
+	maxUploadRate   *atomic.Float64
+	maxDownloadRate *atomic.Float64
 }
 
 type AtomicRecordManager struct {
@@ -134,7 +134,7 @@ func (m *AtomicRecordManager) GetOrCreateAtomicRecord(cacheKey string, store *St
 	}
 
 	return record
-	}
+}
 
 // 创建统计快照
 func (record *AtomicStatsRecord) CreateStatsSnapshot() *StatsRecord {
@@ -569,7 +569,7 @@ func (s *Store) StoreNodeWeightRanking(group, config string, ranking map[string]
 }
 
 // 获取目标的最佳代理
-func (s *Store) GetBestProxyForTarget(group, config string, target string, weightType string, allStats bool) ([]string, []float64, error) {
+func (s *Store) GetBestProxyForTarget(group, config, target, weightType string, allStats bool, topN int) ([]string, []float64, error) {
 	if target == "" {
 		return nil, nil, errors.New("empty target")
 	}
@@ -776,7 +776,6 @@ func (s *Store) GetBestProxyForTarget(group, config string, target string, weigh
 		return nodeList[i].weight > nodeList[j].weight
 	})
 
-	topN := 3
 	if len(nodeList) < topN {
 		topN = len(nodeList)
 	}
@@ -958,7 +957,7 @@ func (s *Store) GetActiveASNs(group, config string, limit int, all bool) map[str
 }
 
 // RunPrefetch 最佳节点预先获取
-func (s *Store) RunPrefetch(group, config string, proxyMap map[string]string) int {
+func (s *Store) RunPrefetch(group, config string, proxyMap map[string]string, topN int) int {
 	log.Debugln("[SmartStore] Executing domain and ASN pre-calculation for policy group [%s]", group)
 
 	blockedNodes := make(map[string]bool)
@@ -999,10 +998,10 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]string) in
 	prefetchASNs := 0
 
 	type prefetchItem struct {
-		target     string
-		weightType string
-		bestNode   string
-		bestWeight float64
+		target      string
+		weightType  string
+		bestNodes   []string
+		bestWeights []float64
 	}
 
 	var domainItems []prefetchItem
@@ -1011,18 +1010,24 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]string) in
 	// 域名
 	for domain, activeTypes := range domains {
 		for _, weightType := range activeTypes {
-			bestNodes, bestWeights, err := s.GetBestProxyForTarget(group, config, domain, weightType, true)
+			bestNodes, bestWeights, err := s.GetBestProxyForTarget(group, config, domain, weightType, true, topN)
 			if err != nil || len(bestNodes) == 0 || bestNodes[0] == "" || bestWeights[0] <= 0 {
 				continue
 			}
-			bestNode := bestNodes[0]
-			bestWeight := bestWeights[0]
-			if _, exists := availableProxyMap[bestNode]; exists {
+			nodes := make([]string, 0, len(bestNodes))
+			weights := make([]float64, 0, len(bestWeights))
+			for i := 0; i < len(bestNodes); i++ {
+				if _, exists := availableProxyMap[bestNodes[i]]; exists {
+					nodes = append(nodes, bestNodes[i])
+					weights = append(weights, bestWeights[i])
+				}
+			}
+			if len(nodes) > 0 {
 				item := prefetchItem{
-					target:     domain,
-					weightType: weightType,
-					bestNode:   bestNode,
-					bestWeight: bestWeight,
+					target:      domain,
+					weightType:  weightType,
+					bestNodes:   nodes,
+					bestWeights: weights,
 				}
 				domainItems = append(domainItems, item)
 			}
@@ -1040,18 +1045,24 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]string) in
 			} else {
 				continue
 			}
-			bestNodes, bestWeights, err := s.GetBestProxyForTarget(group, config, asn, weightType, true)
+			bestNodes, bestWeights, err := s.GetBestProxyForTarget(group, config, asn, weightType, true, topN)
 			if err != nil || len(bestNodes) == 0 || bestNodes[0] == "" || bestWeights[0] <= 0 {
 				continue
 			}
-			bestNode := bestNodes[0]
-			bestWeight := bestWeights[0]
-			if _, exists := availableProxyMap[bestNode]; exists {
+			nodes := make([]string, 0, len(bestNodes))
+			weights := make([]float64, 0, len(bestWeights))
+			for i := 0; i < len(bestNodes); i++ {
+				if _, exists := availableProxyMap[bestNodes[i]]; exists {
+					nodes = append(nodes, bestNodes[i])
+					weights = append(weights, bestWeights[i])
+				}
+			}
+			if len(nodes) > 0 {
 				item := prefetchItem{
-					target:     asn,
-					weightType: weightType,
-					bestNode:   bestNode,
-					bestWeight: bestWeight,
+					target:      asn,
+					weightType:  weightType,
+					bestNodes:   nodes,
+					bestWeights: weights,
 				}
 				asnItems = append(asnItems, item)
 			}
@@ -1060,58 +1071,58 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]string) in
 
 	// 域名
 	for _, item := range domainItems {
-		oldNode, oldWeight := s.GetPrefetchResult(group, config, item.target, item.weightType)
-		newWeight := math.Round(item.bestWeight*100) / 100
-		oldWeightRounded := math.Round(oldWeight*100) / 100
+		oldNodes, oldWeights := s.GetPrefetchResult(group, config, item.target, item.weightType)
+		newWeight := math.Round(item.bestWeights[0]*100) / 100
+		oldWeightRounded := math.Round(oldWeights[0]*100) / 100
 
-		if oldNode == "" {
-			s.StorePrefetchResult(group, config, item.target, item.weightType, item.bestNode, item.bestWeight)
+		if len(oldNodes) == 0 {
+			s.StorePrefetchResult(group, config, item.target, item.weightType, item.bestNodes, item.bestWeights)
 			prefetchDomains++
-			log.Debugln("[SmartStore] Prefetching domain [%s] with best node [%s] for group [%s], weight type [%s], weight: %.2f (no old result)",
-				item.target, item.bestNode, group, item.weightType, item.bestWeight)
+			log.Debugln("[SmartStore] Prefetching domain [%s] with best node [%v] for group [%s], weight type [%s], weight: %v (no old result)",
+				item.target, item.bestNodes, group, item.weightType, item.bestWeights)
 			continue
 		}
 
-		if oldNode == item.bestNode {
+		if oldNodes[0] == item.bestNodes[0] {
 			if newWeight != oldWeightRounded {
-				s.StorePrefetchResult(group, config, item.target, item.weightType, item.bestNode, item.bestWeight)
+				s.StorePrefetchResult(group, config, item.target, item.weightType, item.bestNodes, item.bestWeights)
 				prefetchDomains++
-				log.Debugln("[SmartStore] Prefetching domain [%s] with best node [%s] for group [%s], weight type [%s], weight: %.2f (old: %.2f, same node, weight changed)",
-					item.target, item.bestNode, group, item.weightType, item.bestWeight, oldWeight)
+				log.Debugln("[SmartStore] Prefetching domain [%s] with best node [%v] for group [%s], weight type [%s], weight: %v (old: %v, same node, weight changed)",
+					item.target, item.bestNodes, group, item.weightType, item.bestWeights, oldWeights)
 			}
 		} else if newWeight > oldWeightRounded {
-			s.StorePrefetchResult(group, config, item.target, item.weightType, item.bestNode, item.bestWeight)
+			s.StorePrefetchResult(group, config, item.target, item.weightType, item.bestNodes, item.bestWeights)
 			prefetchDomains++
-			log.Debugln("[SmartStore] Prefetching domain [%s] with best node [%s] for group [%s], weight type [%s], weight: %.2f (old: %.2f, upgraded)",
-				item.target, item.bestNode, group, item.weightType, item.bestWeight, oldWeight)
+			log.Debugln("[SmartStore] Prefetching domain [%s] with best node [%v] for group [%s], weight type [%s], weight: %v (old: %v, upgraded)",
+				item.target, item.bestNodes, group, item.weightType, item.bestWeights, oldWeights)
 		}
 	}
 
 	// ASN
 	for _, item := range asnItems {
-		oldNode, oldWeight := s.GetPrefetchResult(group, config, item.target, item.weightType)
-		newWeight := math.Round(item.bestWeight*100) / 100
-		oldWeightRounded := math.Round(oldWeight*100) / 100
-		if oldNode == "" {
-			s.StorePrefetchResult(group, config, item.target, item.weightType, item.bestNode, item.bestWeight)
+		oldNodes, oldWeights := s.GetPrefetchResult(group, config, item.target, item.weightType)
+		newWeight := math.Round(item.bestWeights[0]*100) / 100
+		oldWeightRounded := math.Round(oldWeights[0]*100) / 100
+		if len(oldNodes) == 0 {
+			s.StorePrefetchResult(group, config, item.target, item.weightType, item.bestNodes, item.bestWeights)
 			prefetchASNs++
-			log.Debugln("[SmartStore] Prefetching ASN [%s] with best node [%s] for group [%s], weight type [%s], weight: %.2f (no old result)",
-				item.target, item.bestNode, group, item.weightType, item.bestWeight)
+			log.Debugln("[SmartStore] Prefetching ASN [%s] with best node [%v] for group [%s], weight type [%s], weight: %v (no old result)",
+				item.target, item.bestNodes, group, item.weightType, item.bestWeights)
 			continue
 		}
 
-		if oldNode == item.bestNode {
+		if oldNodes[0] == item.bestNodes[0] {
 			if newWeight != oldWeightRounded {
-				s.StorePrefetchResult(group, config, item.target, item.weightType, item.bestNode, item.bestWeight)
+				s.StorePrefetchResult(group, config, item.target, item.weightType, item.bestNodes, item.bestWeights)
 				prefetchASNs++
-				log.Debugln("[SmartStore] Prefetching ASN [%s] with best node [%s] for group [%s], weight type [%s], weight: %.2f (old: %.2f, same node, weight changed)",
-					item.target, item.bestNode, group, item.weightType, item.bestWeight, oldWeight)
+				log.Debugln("[SmartStore] Prefetching ASN [%s] with best node [%v] for group [%s], weight type [%s], weight: %v (old: %v, same node, weight changed)",
+					item.target, item.bestNodes, group, item.weightType, item.bestWeights, oldWeights)
 			}
 		} else if newWeight > oldWeightRounded {
-			s.StorePrefetchResult(group, config, item.target, item.weightType, item.bestNode, item.bestWeight)
+			s.StorePrefetchResult(group, config, item.target, item.weightType, item.bestNodes, item.bestWeights)
 			prefetchASNs++
-			log.Debugln("[SmartStore] Prefetching ASN [%s] with best node [%s] for group [%s], weight type [%s], weight: %.2f (old: %.2f, upgraded)",
-				item.target, item.bestNode, group, item.weightType, item.bestWeight, oldWeight)
+			log.Debugln("[SmartStore] Prefetching ASN [%s] with best node [%v] for group [%s], weight type [%s], weight: %v (old: %v, upgraded)",
+				item.target, item.bestNodes, group, item.weightType, item.bestWeights, oldWeights)
 		}
 	}
 

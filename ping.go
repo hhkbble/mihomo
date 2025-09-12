@@ -5,7 +5,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"net"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -39,13 +42,13 @@ type Config struct {
 // DNS for translating the host name to IP address. This resolution
 // is performed once and a single of retrieved IP addresses is used for all
 // connections.
-func Ping(addr string, config *Config) (PingResult, error) {
+func Ping(addr string, config *Config) (chan PingResult, error) {
 	if config.Count == 0 {
 		config.Count = 1
 	}
 	host, ipAddr, port, err := resolveAddr(addr)
 	if err != nil {
-		return PingResult{}, err
+		return nil, err
 	}
 	result := PingResult{
 		Host:    host,
@@ -84,13 +87,23 @@ func Ping(addr string, config *Config) (PingResult, error) {
 	results := make(chan connectDuration, config.Count)
 	var wg sync.WaitGroup
 	wg.Add(config.Count)
+	sig := make(chan os.Signal)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		<-sig
+		close(done)
+	}()
 	for i := 0; i < config.Count; i++ {
 		go func() {
 			defer wg.Done()
-			d, err := timeit(f)
-			results <- connectDuration{
-				seconds: d,
-				err:     err,
+			for {
+				d, err := timeit(f)
+				select {
+				case <-done:
+					return
+				case results <- connectDuration{seconds: d, err: err}:
+				}
 			}
 		}()
 	}
@@ -102,15 +115,27 @@ func Ping(addr string, config *Config) (PingResult, error) {
 	}()
 
 	// Collect workers' results
-	durations := make([]float64, 0, config.Count)
-	for res := range results {
-		if res.err != nil {
-			return result, res.err
+	pingResults := make(chan PingResult, config.Count)
+	go func() {
+		durations := make([]float64, 0, config.Count)
+		for {
+			res, ok := <-results
+			if !ok {
+				close(pingResults)
+				return
+			}
+			if res.err != nil {
+				continue
+			}
+			durations = append(durations, res.seconds)
+			if len(durations) >= config.Count {
+				result.setSummaryStats(summarize(durations))
+				pingResults <- result
+				durations = durations[:0]
+			}
 		}
-		durations = append(durations, res.seconds)
-	}
-	result.setSummaryStats(summarize(durations))
-	return result, nil
+	}()
+	return pingResults, nil
 }
 
 type connectDuration struct {

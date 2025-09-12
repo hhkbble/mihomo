@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/x509"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -60,7 +59,7 @@ func main() {
 		InsecureSkipVerify: *insecure,
 		RootCAs:            caCerts,
 	}
-	result, err := tlsping.Ping(serverAddr, &config)
+	pingResults, err := tlsping.Ping(serverAddr, &config)
 	if err != nil {
 		errlog.Printf("error connecting to '%s': %s\n", serverAddr, err)
 		os.Exit(1)
@@ -69,33 +68,17 @@ func main() {
 	if *tcpOnly {
 		s = "TCP"
 	}
-	if !*jsonOutput {
-		outlog.Printf("%s connection to %s (%s) (%d connections)\n", s, serverAddr, result.IPAddr, *count)
-		outlog.Printf("min/avg/max/stddev = %s/%s/%s/%s\n", result.MinStr(), result.AvgStr(), result.MaxStr(), result.StdStr())
-		os.Exit(0)
+	for {
+		result, ok := <-pingResults
+		if !ok {
+			break
+		}
+		if !*jsonOutput {
+			outlog.Printf("%s connection to %s (%s) (%d connections)\n", s, serverAddr, result.IPAddr, *count)
+			outlog.Printf("min/avg/max/stddev = %s/%s/%s/%s\n", result.MinStr(), result.AvgStr(), result.MaxStr(), result.StdStr())
+		}
 	}
 
-	// Format the result in JSON
-	jsonRes := JsonResult{
-		Host:       result.Host,
-		IPAddr:     result.IPAddr,
-		ServerAddr: result.Address,
-		Connection: s,
-		Min:        result.Min,
-		Max:        result.Max,
-		Count:      result.Count,
-		Avg:        result.Avg,
-		Std:        result.Std,
-	}
-	if err != nil {
-		jsonRes.Error = fmt.Sprintf("%s", err)
-	}
-	b, err := json.Marshal(jsonRes)
-	if err != nil {
-		errlog.Printf("error producing JSON: %s\n", err)
-		os.Exit(1)
-	}
-	os.Stdout.Write(b)
 	os.Exit(0)
 }
 
